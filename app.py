@@ -25,42 +25,95 @@ def chat_with_gpt(message):
         print(f"OpenAI klaida: {str(e)}")
         return "Atsiprašome, įvyko klaida."
 
+def fetch_shopify_messages():
+    graphql_query = {
+        "query": """
+        query {
+            conversations(first: 10) {
+                edges {
+                    node {
+                        id
+                        messages(first: 5) {
+                            edges {
+                                node {
+                                    id
+                                    content
+                                    from {
+                                        __typename
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        """
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
+    }
+    
+    response = requests.post(f"{SHOPIFY_STORE_URL}/admin/api/2023-01/graphql.json", json=graphql_query, headers=headers)
+    return response.json()
+
 def check_new_messages():
     while True:
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
-            }
-            response = requests.get(f"{SHOPIFY_STORE_URL}/admin/api/2023-01/conversations.json", headers=headers)
+            print("Tikrinamos naujos žinutės Shopify (GraphQL API)...")
+            data = fetch_shopify_messages()
+            conversations = data.get("data", {}).get("conversations", {}).get("edges", [])
             
-            if response.status_code == 200:
-                conversations = response.json().get("conversations", [])
-                for convo in conversations:
-                    messages = convo.get("messages", [])
-                    if messages:
-                        last_message = messages[-1]
-                        if last_message.get("from", "") == "customer":
-                            message_text = last_message.get("message", "")
-                            convo_id = convo.get("id")
-                            
-                            ai_response = chat_with_gpt(message_text)
-                            
-                            message_data = {"message": ai_response}
-                            response = requests.post(
-                                f"{SHOPIFY_STORE_URL}/admin/api/2023-01/conversations/{convo_id}/messages.json",
-                                json=message_data,
-                                headers=headers
-                            )
-                            print(f"Atsakymas į {convo_id}: {ai_response}")
-            else:
-                print(f"Shopify API klaida: {response.status_code} - {response.text}")
+            for convo in conversations:
+                convo_id = convo.get("node", {}).get("id")
+                messages = convo.get("node", {}).get("messages", {}).get("edges", [])
+                
+                if messages:
+                    last_message = messages[-1]["node"]
+                    message_text = last_message.get("content", "")
+                    sender = last_message.get("from", {}).get("__typename", "")
+                    
+                    if sender == "Customer":
+                        ai_response = chat_with_gpt(message_text)
+                        send_shopify_reply(convo_id, ai_response)
+                    else:
+                        print("Paskutinė žinutė ne iš kliento, ignoruojama.")
         except Exception as e:
             print(f"Klaida tikrinant žinutes: {str(e)}")
-        time.sleep(10)
+        time.sleep(3)
 
-# Paleidžiame atskirą giją, kuri tikrina Shopify Inbox kas 10 sek.
+def send_shopify_reply(conversation_id, message):
+    graphql_mutation = {
+        "query": """
+        mutation sendMessage($conversationId: ID!, $content: String!) {
+            conversationReply(conversationId: $conversationId, content: $content) {
+                message {
+                    id
+                    content
+                }
+            }
+        }
+        """,
+        "variables": {
+            "conversationId": conversation_id,
+            "content": message
+        }
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_ACCESS_TOKEN
+    }
+    
+    response = requests.post(f"{SHOPIFY_STORE_URL}/admin/api/2023-01/graphql.json", json=graphql_mutation, headers=headers)
+    print(f"Atsakymas išsiųstas į {conversation_id}: {message}")
+    return response.json()
+
+# Paleidžiame atskirą giją, kuri tikrina Shopify Inbox kas 3 sek.
 threading.Thread(target=check_new_messages, daemon=True).start()
 
 if __name__ == "__main__":
+    print("AI Chatbot paleistas ir laukia Shopify žinučių (GraphQL API)...")
     app.run(host="0.0.0.0", port=5000)
